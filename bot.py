@@ -1,5 +1,6 @@
 import asyncio
 import random
+import re
 import discord
 
 from config import DISCORD_TOKEN, POKETWO_BOT_ID, HELPER_BOT_IDS
@@ -11,8 +12,9 @@ from services.stealth import simulate_typo
 bot = discord.Client()
 catch_queue = CatchQueue()
 
-# --- Incense Configuration ---
+# --- Helper Bot & Channel Configurations ---
 INCENSE_HELPER_BOT_ID = 1307910235737948252
+HEADER_HELPER_BOT_ID = 874910942490677270
 INCENSE_CHANNELS = {str(i) for i in range(1, 11)}
 
 # --- Global State & Locks ---
@@ -31,6 +33,17 @@ ping_counter = 0
 next_miss_target = random.randint(10, 15)
 
 
+def get_pokemon_name(content: str) -> str | None:
+    """
+    Extracts the Pokemon name from the '## Swalot <:_:...>【<:...>】' format first,
+    then falls back to services.parser.extract_pokemon_name.
+    """
+    header_match = re.search(r"^##\s+([^<【\n]+)", content.strip(), re.MULTILINE)
+    if header_match:
+        return header_match.group(1).strip()
+    return extract_pokemon_name(content)
+
+
 async def afk_timer(afk_seconds: int) -> None:
     global is_afk
     minutes = afk_seconds // 60
@@ -44,7 +57,7 @@ async def afk_timer(afk_seconds: int) -> None:
 
 
 async def buy_incense_sequence(guild: discord.Guild) -> None:
-    """Buys incense sequentially in channels named 1 to 10 with a 1-2s delay."""
+    """Buys incense sequentially in channels named 1 to 10 with a 1-2s random delay."""
     print("🔥 [Incense] Starting incense purchase sequence across channels 1 to 10...")
     for i in range(1, 11):
         if is_paused or not is_incense_mode:
@@ -102,7 +115,7 @@ async def on_message(message: discord.Message) -> None:
 
         if msg_content == "!inc":
             is_incense_mode = True
-            is_afk = False  # Clear AFK state if transitioning into Incense Mode
+            is_afk = False
             print("🔥 [Mode Switch] INCENSE MODE ACTIVATED. Normal ping-catching is now OFF.")
             if message.guild:
                 bot.loop.create_task(buy_incense_sequence(message.guild))
@@ -171,7 +184,7 @@ async def on_message(message: discord.Message) -> None:
     if is_incense_mode:
         channel_name = getattr(message.channel, "name", "")
         if message.author.id == INCENSE_HELPER_BOT_ID and channel_name in INCENSE_CHANNELS:
-            pokemon_name = extract_pokemon_name(message.content)
+            pokemon_name = get_pokemon_name(message.content)
             if not pokemon_name:
                 return
 
@@ -196,7 +209,7 @@ async def on_message(message: discord.Message) -> None:
                         cmd = random.choice(["c", "catch"])
                         final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
 
-                        typing_delay = len( pokemon_name) * random.uniform(0.03, 0.06)
+                        typing_delay = len(pokemon_name) * random.uniform(0.03, 0.06)
                         async with message.channel.typing():
                             await asyncio.sleep(typing_delay)
 
@@ -209,9 +222,16 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # =========================================================================
-    # 4B. NORMAL MODE CATCHING LOGIC (Standard Ping-Reply Catching)
+    # 4B. NORMAL MODE CATCHING LOGIC (Ping-Reply OR Bot 874910942490677270)
     # =========================================================================
-    if message.author.id in HELPER_BOT_IDS and str(bot.user.id) in message.content:
+    is_pinged_helper = (
+        message.author.id in HELPER_BOT_IDS and str(bot.user.id) in message.content
+    )
+    is_header_helper = (
+        message.author.id == HEADER_HELPER_BOT_ID and message.content.strip().startswith("## ")
+    )
+
+    if is_pinged_helper or is_header_helper:
 
         # --- Smart Miss Logic ---
         ping_counter += 1
@@ -229,7 +249,7 @@ async def on_message(message: discord.Message) -> None:
             bot.loop.create_task(afk_timer(afk_seconds))
             return
 
-        pokemon_name = extract_pokemon_name(message.content)
+        pokemon_name = get_pokemon_name(message.content)
         if not pokemon_name:
             return
 
