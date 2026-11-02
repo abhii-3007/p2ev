@@ -2,6 +2,7 @@ import asyncio
 import random
 import re
 import sys
+import time
 import discord
 
 from config import DISCORD_TOKEN, POKETWO_BOT_ID, HELPER_BOT_IDS
@@ -18,6 +19,9 @@ INCENSE_HELPER_BOT_ID = 1307910235737948252
 HEADER_HELPER_BOT_ID = 874910942490677270
 INCENSE_CHANNELS = {str(i) for i in range(1, 11)}
 
+# Maximum seconds before an incense spawn despawns (20s window with 0.8s network buffer)
+INCENSE_DESPAWN_LIMIT = 19.2
+
 # --- Global State & Locks ---
 is_paused = False
 is_afk = False
@@ -27,7 +31,10 @@ active_incense_guild: discord.Guild | None = None
 # Task tracker for ongoing channel 1-10 command loops (buy / p / r)
 incense_cmd_task: asyncio.Task | None = None
 
-# This lock ensures the bot can never type/send two different messages at the exact same time
+# Tracks active catch tasks per channel (channel_name -> asyncio.Task) for wave replacement
+incense_tasks: dict[str, asyncio.Task] = {}
+
+# Ensures the bot can NEVER type/send two messages at the exact same time across any channel
 bot_action_lock = asyncio.Lock()
 
 # Tracks how many pokemon are currently queued or being caught
@@ -115,9 +122,68 @@ def start_incense_channel_task(
     )
 
 
+async def catch_incense_spawn(
+    channel: discord.abc.Messageable,
+    channel_name: str,
+    pokemon_name: str,
+    spawn_timestamp: float,
+) -> None:
+    """
+    Direct, non-queued incense catcher with per-channel task replacement.
+    Uses bot_action_lock so zero messages conflict across channels.
+    """
+    global pending_catches
+    pending_catches += 1
+    try:
+        if is_paused or not is_incense_mode:
+            return
+
+        # Strictly serialize across all 10 channels so two channels never send at once
+        async with bot_action_lock:
+            if is_paused or not is_incense_mode:
+                return
+
+            # Check if the spawn is about to hit the 20s despawn limit
+            elapsed_before_gap = time.monotonic() - spawn_timestamp
+            if elapsed_before_gap >= INCENSE_DESPAWN_LIMIT:
+                print(
+                    f"⏳ [Incense] Skipped {pokemon_name} in #{channel_name} "
+                    f"(Expired: {elapsed_before_gap:.1f}s >= 20s despawn window)"
+                )
+                return
+
+            # Random gap between 0.70s and 1.25s
+            catch_gap = random.uniform(0.70, 1.25)
+            await asyncio.sleep(catch_gap)
+
+            if is_paused or not is_incense_mode:
+                return
+
+            final_name = pokemon_name.lower() if random.random() < 0.70 else pokemon_name
+            cmd = random.choice(["c", "catch"])
+            final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
+
+            # Fast typing burst (0.15s to 0.30s)
+            typing_delay = random.uniform(0.15, 0.30)
+            async with channel.typing():
+                await asyncio.sleep(typing_delay)
+
+            await channel.send(final_message)
+            total_elapsed = time.monotonic() - spawn_timestamp
+            print(
+                f"🏓 [Incense] Caught {final_name} in #{channel_name} "
+                f"(Gap: {int(catch_gap * 1000)}ms | Wave Time: {total_elapsed:.2f}s/20s)"
+            )
+    except asyncio.CancelledError:
+        print(f"🚫 [Incense] Task in #{channel_name} cancelled (superseded by new spawn).")
+        raise
+    finally:
+        pending_catches -= 1
+
+
 @bot.event
 async def on_ready() -> None:
-    print(f"Logged in as {bot.user} | Ultimate Stealth Mode + Async Queue Active.")
+    print(f"Logged in as {bot.user} | Ultimate Stealth Mode + Wave Incense Catcher Active.")
     print(f"🎯 [Stealth] Next forced miss is scheduled in {next_miss_target} pings.")
 
 
@@ -147,7 +213,7 @@ async def on_message(message: discord.Message) -> None:
             is_afk = False
             if message.guild:
                 active_incense_guild = message.guild
-                print("🔥 [Mode Switch] INCENSE MODE STARTED. Buying incense in channels 1-10 & catching enabled.")
+                print("🔥 [Mode Switch] INCENSE MODE STARTED. Buying incense in channels 1-10 & wave catching enabled.")
                 start_incense_channel_task(
                     message.guild, "inc buy -y", "Buy Incense", abort_if_paused=True
                 )
@@ -185,7 +251,7 @@ async def on_message(message: discord.Message) -> None:
 
         return
 
-    # 2. Safety conditions (Captcha - pauses in BOTH modes; runs inc p in Incense Mode)
+    # 2. Safety conditions (Captcha)
     if (
         message.author.id == POKETWO_BOT_ID
         and "Please tell us you're human!" in message.content
@@ -203,14 +269,14 @@ async def on_message(message: discord.Message) -> None:
                 )
         return
 
-    # 3. Shiny Catch Sequence (Pauses ONLY in Normal Mode; continues in Incense Mode)
+    # 3. Shiny Catch Sequence
     if (
         message.author.id == POKETWO_BOT_ID
         and "These colors seem unusual..." in message.content
         and str(bot.user.id) in message.content
     ):
         if is_incense_mode:
-            print(f"✨ [Incense] Shiny caught in #{getattr(message.channel, 'name', 'unknown')}! Continuing without pausing...")
+            print(f"✨ [Incense] Shiny caught in #{getattr(message.channel, 'name', 'unknown')}! Continuing wave without pausing...")
             return
 
         is_paused = True
@@ -239,12 +305,11 @@ async def on_message(message: discord.Message) -> None:
         bot.loop.create_task(shiny_reaction_sequence())
         return
 
-    # Stop processing if paused (or if AFK in normal mode)
     if is_paused or (is_afk and not is_incense_mode):
         return
 
     # =========================================================================
-    # 4A. INCENSE MODE CATCHING LOGIC (Channels 1-10, Helper ID: 1307910235737948252)
+    # 4A. INCENSE MODE CATCHING LOGIC (Per-Channel Task Replacement)
     # =========================================================================
     if is_incense_mode:
         channel_name = getattr(message.channel, "name", "")
@@ -256,41 +321,28 @@ async def on_message(message: discord.Message) -> None:
             if not pokemon_name:
                 return
 
-            pending_catches += 1
-            print(f"📥 [Incense] #{channel_name} queued: {pokemon_name} (Pending: {pending_catches})")
+            # Cancel any existing active catch task for this specific channel
+            if channel_name in incense_tasks and not incense_tasks[channel_name].done():
+                print(f"🔄 [Incense Wave] New spawn in #{channel_name}! Cancelling previous unfinished catch task.")
+                incense_tasks[channel_name].cancel()
 
-            async def process_incense_catch() -> None:
-                global pending_catches
-                try:
-                    if is_paused or not is_incense_mode:
-                        return
+            spawn_timestamp = time.monotonic()
+            print(f"⚡ [Incense Wave] Spawn detected in #{channel_name}: {pokemon_name}")
 
-                    # Random 1 to 2 second gap per spawn catch
-                    catch_gap = random.uniform(1.0, 2.0)
-                    await asyncio.sleep(catch_gap)
-
-                    async with bot_action_lock:
-                        if is_paused or not is_incense_mode:
-                            return
-
-                        final_name = pokemon_name.lower() if random.random() < 0.70 else pokemon_name
-                        cmd = random.choice(["c", "catch"])
-                        final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
-
-                        typing_delay = len(pokemon_name) * random.uniform(0.03, 0.06)
-                        async with message.channel.typing():
-                            await asyncio.sleep(typing_delay)
-
-                        await message.channel.send(final_message)
-                        print(f"🏓 [Incense] Caught {final_name} in #{channel_name} (Gap: {int(catch_gap * 1000)}ms)")
-                finally:
-                    pending_catches -= 1
-
-            await catch_queue.add(process_incense_catch)
+            # Create and track the new catch task for this channel
+            task = bot.loop.create_task(
+                catch_incense_spawn(
+                    channel=message.channel,
+                    channel_name=channel_name,
+                    pokemon_name=pokemon_name,
+                    spawn_timestamp=spawn_timestamp,
+                )
+            )
+            incense_tasks[channel_name] = task
         return
 
     # =========================================================================
-    # 4B. NORMAL MODE CATCHING LOGIC (Ping-Reply OR Bot 874910942490677270)
+    # 4B. NORMAL MODE CATCHING LOGIC (Uses CatchQueue + Full Stealth Delays)
     # =========================================================================
     is_pinged_helper = (
         message.author.id in HELPER_BOT_IDS and str(bot.user.id) in message.content
@@ -321,7 +373,6 @@ async def on_message(message: discord.Message) -> None:
         if not pokemon_name:
             return
 
-        # Increase the queue counter right before adding it
         pending_catches += 1
         print(f"\n📥 Ping {ping_counter}/{next_miss_target} added to the queue: {pokemon_name} (Total Pending: {pending_catches})")
 
@@ -333,7 +384,6 @@ async def on_message(message: discord.Message) -> None:
 
                 print(f"⚙️ Processing queued catch for: {pokemon_name}")
 
-                # 1. Read delay
                 read_delay = random.uniform(0.4, 0.8)
                 if random.random() < 0.10:
                     distraction_time = random.uniform(2.0, 5.0)
@@ -342,7 +392,6 @@ async def on_message(message: discord.Message) -> None:
 
                 await asyncio.sleep(read_delay)
 
-                # 2. Start Typing / Catching
                 async with bot_action_lock:
                     if is_paused or is_afk or is_incense_mode:
                         return
@@ -371,7 +420,6 @@ async def on_message(message: discord.Message) -> None:
                     await message.channel.send(final_message)
                     print(f"🏓 Caught: {final_name} (Read: {int(read_delay * 1000)}ms | Typed: {int(typing_delay * 1000)}ms)")
 
-                # 3. Typo Correction (if applicable)
                 if made_typo:
                     realize_delay = random.uniform(0.5, 1.5)
                     await asyncio.sleep(realize_delay)
@@ -391,7 +439,6 @@ async def on_message(message: discord.Message) -> None:
                         await message.channel.send(correct_msg)
                         print(f"🔧 [Stealth] Corrected typo quickly with: {correct_name}")
 
-                # 4. Late Follow-up Message (Runs as a background task)
                 if random.random() < 0.30:
                     async def delayed_follow_up():
                         late_delay = random.uniform(6.0, 14.0)
@@ -430,7 +477,7 @@ async def on_message(message: discord.Message) -> None:
 
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or DISCORD_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "PASTE_YOUR_ACTUAL_TOKEN_HERE":
         print("❌ ERROR: DISCORD_TOKEN is missing! Set it in your .env file or paste it inside config.py.")
         sys.exit(1)
     bot.run(DISCORD_TOKEN)
