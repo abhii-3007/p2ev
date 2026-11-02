@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import random
 import re
 import sys
@@ -19,8 +20,8 @@ INCENSE_HELPER_BOT_ID = 1307910235737948252
 HEADER_HELPER_BOT_ID = 874910942490677270
 INCENSE_CHANNELS = {str(i) for i in range(1, 11)}
 
-# Maximum seconds before an incense spawn despawns (20s window with 0.8s network buffer)
-INCENSE_DESPAWN_LIMIT = 19.2
+# Despawn safety window (20s total per channel; skip only if older than 19.3s)
+INCENSE_DESPAWN_LIMIT = 19.3
 
 # --- Global State & Locks ---
 is_paused = False
@@ -31,13 +32,19 @@ active_incense_guild: discord.Guild | None = None
 # Task tracker for ongoing channel 1-10 command loops (buy / p / r)
 incense_cmd_task: asyncio.Task | None = None
 
-# Tracks active catch tasks per channel (channel_name -> asyncio.Task) for wave replacement
-incense_tasks: dict[str, asyncio.Task] = {}
-
-# Ensures the bot can NEVER type/send two messages at the exact same time across any channel
+# Ensures the bot can NEVER send two messages at the exact same time across any channel
 bot_action_lock = asyncio.Lock()
 
-# Tracks how many pokemon are currently queued or being caught
+# Tracks the monotonic timestamp of the last sent Discord message for exact gap pacing
+last_send_time: float = 0.0
+
+# --- Staggered Incense EDF Scheduler State ---
+# Holds latest active spawn per channel: channel_name -> (spawn_timestamp, channel_obj, pokemon_name)
+active_channel_spawns: dict[str, tuple[float, discord.abc.Messageable, str]] = {}
+incense_wake_event = asyncio.Event()
+incense_worker_task: asyncio.Task | None = None
+
+# Tracks how many pokemon are currently queued or being caught in Normal Mode
 pending_catches = 0
 
 # --- Smart Miss Counter Variables ---
@@ -54,6 +61,76 @@ def get_pokemon_name(content: str) -> str | None:
     if header_match:
         return header_match.group(1).strip()
     return extract_pokemon_name(content)
+
+
+async def paced_send(
+    channel: discord.abc.Messageable,
+    content: str,
+    min_gap: float = 0.75,
+    max_gap: float = 1.15,
+) -> float:
+    """
+    Acquires bot_action_lock and sends a message while compensating for HTTP network latency.
+    Guarantees a random gap between consecutive messages across all channels without conflict.
+    Returns the actual wait gap applied.
+    """
+    global last_send_time
+    async with bot_action_lock:
+        target_gap = random.uniform(min_gap, max_gap)
+        elapsed_since_last = time.monotonic() - last_send_time
+        remaining_sleep = max(0.0, target_gap - elapsed_since_last)
+
+        if remaining_sleep > 0:
+            await asyncio.sleep(remaining_sleep)
+
+        await channel.send(content)
+        last_send_time = time.monotonic()
+        return target_gap
+
+
+async def incense_scheduler_loop() -> None:
+    """
+    Earliest-Deadline-First (EDF) worker for Incense Mode.
+    Always catches the oldest waiting channel first (Channel 1 -> 2 -> 3 ... -> 10)
+    so every channel is caught well within its own 20-second staggered window.
+    """
+    while True:
+        await incense_wake_event.wait()
+
+        while active_channel_spawns and is_incense_mode and not is_paused:
+            # Pick the channel whose spawn appeared earliest (Earliest Deadline First)
+            oldest_channel = min(
+                active_channel_spawns.keys(),
+                key=lambda ch: active_channel_spawns[ch][0],
+            )
+            spawn_ts, channel_obj, pokemon_name = active_channel_spawns.pop(oldest_channel)
+
+            age = time.monotonic() - spawn_ts
+            if age >= INCENSE_DESPAWN_LIMIT:
+                print(
+                    f"⏳ [Incense] Dropped expired {pokemon_name} in #{oldest_channel} "
+                    f"(Age: {age:.1f}s >= 20s)"
+                )
+                continue
+
+            final_name = pokemon_name.lower() if random.random() < 0.70 else pokemon_name
+            cmd = random.choice(["c", "catch"])
+            final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
+
+            try:
+                gap_used = await paced_send(
+                    channel_obj, final_message, min_gap=0.75, max_gap=1.15
+                )
+                total_age = time.monotonic() - spawn_ts
+                print(
+                    f"🏓 [Incense] Caught {final_name} in #{oldest_channel} "
+                    f"(Pace: {int(gap_used * 1000)}ms | Spawn Age: {total_age:.2f}s/20s | "
+                    f"Remaining in wave: {len(active_channel_spawns)})"
+                )
+            except Exception as e:
+                print(f"⚠️ [Incense] Send error in #{oldest_channel}: {e}")
+
+        incense_wake_event.clear()
 
 
 async def afk_timer(afk_seconds: int) -> None:
@@ -75,8 +152,9 @@ async def run_incense_channel_command(
     abort_if_paused: bool = True,
 ) -> None:
     """
-    Sends '<@POKETWO_BOT_ID> <subcommand>' across channels 1 to 10 in the given server
-    one by one with a random 1.0 to 2.0 second delay.
+    Sends '<@POKETWO_BOT_ID> <subcommand>' across channels 1 to 10 sequentially.
+    Uses paced_send so spawns appearing in early channels (1, 2, 3...) can be
+    caught seamlessly in between buying/resuming later channels (4..10).
     """
     print(f"🔥 [Incense] Starting '{subcommand}' ({action_label}) across channels 1 to 10...")
     for i in range(1, 11):
@@ -89,20 +167,19 @@ async def run_incense_channel_command(
             print(f"⚠️ [Incense] Channel '{i}' not found in this server. Skipping.")
             continue
 
-        delay = random.uniform(1.0, 2.0)
-        await asyncio.sleep(delay)
+        # Short yield so the EDF catch scheduler can grab the lock first if an urgent spawn is waiting
+        await asyncio.sleep(random.uniform(0.95, 1.35))
 
-        async with bot_action_lock:
-            if abort_if_paused and (is_paused or not is_incense_mode):
-                print(f"⏹️ [Incense] '{subcommand}' sequence halted before sending.")
-                return
+        if abort_if_paused and (is_paused or not is_incense_mode):
+            print(f"⏹️ [Incense] '{subcommand}' sequence halted before sending.")
+            return
 
-            cmd_msg = f"<@{POKETWO_BOT_ID}> {subcommand}"
-            async with channel.typing():
-                await asyncio.sleep(len(cmd_msg) * random.uniform(0.03, 0.06))
-
-            await channel.send(cmd_msg)
-            print(f"✅ [Incense] Sent '{subcommand}' in #{channel.name} (Delay: {int(delay * 1000)}ms)")
+        cmd_msg = f"<@{POKETWO_BOT_ID}> {subcommand}"
+        try:
+            gap_used = await paced_send(channel, cmd_msg, min_gap=0.80, max_gap=1.20)
+            print(f"✅ [Incense] Sent '{subcommand}' in #{channel.name} (Pace: {int(gap_used * 1000)}ms)")
+        except Exception as e:
+            print(f"⚠️ [Incense] Failed sending '{subcommand}' in #{channel.name}: {e}")
 
     print(f"🎉 [Incense] Finished '{subcommand}' ({action_label}) in channels 1 to 10!")
 
@@ -122,68 +199,13 @@ def start_incense_channel_task(
     )
 
 
-async def catch_incense_spawn(
-    channel: discord.abc.Messageable,
-    channel_name: str,
-    pokemon_name: str,
-    spawn_timestamp: float,
-) -> None:
-    """
-    Direct, non-queued incense catcher with per-channel task replacement.
-    Uses bot_action_lock so zero messages conflict across channels.
-    """
-    global pending_catches
-    pending_catches += 1
-    try:
-        if is_paused or not is_incense_mode:
-            return
-
-        # Strictly serialize across all 10 channels so two channels never send at once
-        async with bot_action_lock:
-            if is_paused or not is_incense_mode:
-                return
-
-            # Check if the spawn is about to hit the 20s despawn limit
-            elapsed_before_gap = time.monotonic() - spawn_timestamp
-            if elapsed_before_gap >= INCENSE_DESPAWN_LIMIT:
-                print(
-                    f"⏳ [Incense] Skipped {pokemon_name} in #{channel_name} "
-                    f"(Expired: {elapsed_before_gap:.1f}s >= 20s despawn window)"
-                )
-                return
-
-            # Random gap between 0.70s and 1.25s
-            catch_gap = random.uniform(0.70, 1.25)
-            await asyncio.sleep(catch_gap)
-
-            if is_paused or not is_incense_mode:
-                return
-
-            final_name = pokemon_name.lower() if random.random() < 0.70 else pokemon_name
-            cmd = random.choice(["c", "catch"])
-            final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
-
-            # Fast typing burst (0.15s to 0.30s)
-            typing_delay = random.uniform(0.15, 0.30)
-            async with channel.typing():
-                await asyncio.sleep(typing_delay)
-
-            await channel.send(final_message)
-            total_elapsed = time.monotonic() - spawn_timestamp
-            print(
-                f"🏓 [Incense] Caught {final_name} in #{channel_name} "
-                f"(Gap: {int(catch_gap * 1000)}ms | Wave Time: {total_elapsed:.2f}s/20s)"
-            )
-    except asyncio.CancelledError:
-        print(f"🚫 [Incense] Task in #{channel_name} cancelled (superseded by new spawn).")
-        raise
-    finally:
-        pending_catches -= 1
-
-
 @bot.event
 async def on_ready() -> None:
-    print(f"Logged in as {bot.user} | Ultimate Stealth Mode + Wave Incense Catcher Active.")
+    global incense_worker_task
+    if incense_worker_task is None or incense_worker_task.done():
+        incense_worker_task = bot.loop.create_task(incense_scheduler_loop())
+
+    print(f"Logged in as {bot.user} | Staggered EDF Incense Catcher + Stealth Mode Active.")
     print(f"🎯 [Stealth] Next forced miss is scheduled in {next_miss_target} pings.")
 
 
@@ -198,11 +220,14 @@ async def on_message(message: discord.Message) -> None:
     if message.author.id == bot.user.id:
         if msg_content == "!pause":
             is_paused = True
+            active_channel_spawns.clear()
             print("⏸️ Bot manually paused.")
             return
 
         if msg_content == "!resume":
             is_paused = False
+            if is_incense_mode and active_channel_spawns:
+                incense_wake_event.set()
             mode_str = "INCENSE MODE" if is_incense_mode else "NORMAL MODE"
             print(f"▶️ Bot manually resumed in {mode_str}.")
             return
@@ -211,9 +236,10 @@ async def on_message(message: discord.Message) -> None:
             is_incense_mode = True
             is_paused = False
             is_afk = False
+            active_channel_spawns.clear()
             if message.guild:
                 active_incense_guild = message.guild
-                print("🔥 [Mode Switch] INCENSE MODE STARTED. Buying incense in channels 1-10 & wave catching enabled.")
+                print("🔥 [Mode Switch] INCENSE MODE STARTED. Staggering buy across 1-10 & catching immediately.")
                 start_incense_channel_task(
                     message.guild, "inc buy -y", "Buy Incense", abort_if_paused=True
                 )
@@ -221,8 +247,9 @@ async def on_message(message: discord.Message) -> None:
 
         if msg_content == "!inc_pause":
             is_paused = True
+            active_channel_spawns.clear()
             target_guild = message.guild or active_incense_guild
-            print("⏸️ [Incense] !inc_pause triggered. Pausing catches and sending 'inc p' to channels 1-10...")
+            print("⏸️ [Incense] !inc_pause triggered. Clearing queue and sending 'inc p' to channels 1-10...")
             if target_guild:
                 start_incense_channel_task(
                     target_guild, "inc p", "Pause Incense", abort_if_paused=False
@@ -233,6 +260,7 @@ async def on_message(message: discord.Message) -> None:
             is_incense_mode = True
             is_paused = False
             is_afk = False
+            active_channel_spawns.clear()
             target_guild = message.guild or active_incense_guild
             print("▶️ [Incense] !inc_resume triggered. Resuming catches and sending 'inc r' to channels 1-10...")
             if target_guild:
@@ -244,6 +272,7 @@ async def on_message(message: discord.Message) -> None:
 
         if msg_content == "!normal":
             is_incense_mode = False
+            active_channel_spawns.clear()
             if incense_cmd_task and not incense_cmd_task.done():
                 incense_cmd_task.cancel()
             print("🌿 [Mode Switch] NORMAL MODE ACTIVATED. Incense mode is now OFF.")
@@ -258,6 +287,7 @@ async def on_message(message: discord.Message) -> None:
         and str(bot.user.id) in message.content
     ):
         is_paused = True
+        active_channel_spawns.clear()
         print("⚠️ Captcha detected targeting YOUR account. Script paused immediately!")
 
         if is_incense_mode:
@@ -309,7 +339,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # =========================================================================
-    # 4A. INCENSE MODE CATCHING LOGIC (Per-Channel Task Replacement)
+    # 4A. INCENSE MODE CATCHING LOGIC (Staggered EDF Scheduler)
     # =========================================================================
     if is_incense_mode:
         channel_name = getattr(message.channel, "name", "")
@@ -321,24 +351,17 @@ async def on_message(message: discord.Message) -> None:
             if not pokemon_name:
                 return
 
-            # Cancel any existing active catch task for this specific channel
-            if channel_name in incense_tasks and not incense_tasks[channel_name].done():
-                print(f"🔄 [Incense Wave] New spawn in #{channel_name}! Cancelling previous unfinished catch task.")
-                incense_tasks[channel_name].cancel()
-
-            spawn_timestamp = time.monotonic()
-            print(f"⚡ [Incense Wave] Spawn detected in #{channel_name}: {pokemon_name}")
-
-            # Create and track the new catch task for this channel
-            task = bot.loop.create_task(
-                catch_incense_spawn(
-                    channel=message.channel,
-                    channel_name=channel_name,
-                    pokemon_name=pokemon_name,
-                    spawn_timestamp=spawn_timestamp,
+            now = time.monotonic()
+            if channel_name in active_channel_spawns:
+                old_ts, _, old_poke = active_channel_spawns[channel_name]
+                print(
+                    f"🔄 [Incense] #{channel_name} replaced '{old_poke}' ({now - old_ts:.1f}s old) "
+                    f"with new spawn '{pokemon_name}'"
                 )
-            )
-            incense_tasks[channel_name] = task
+
+            # Register spawn in the EDF map and wake the scheduler immediately
+            active_channel_spawns[channel_name] = (now, message.channel, pokemon_name)
+            incense_wake_event.set()
         return
 
     # =========================================================================
