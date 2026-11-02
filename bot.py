@@ -19,8 +19,9 @@ INCENSE_HELPER_BOT_ID = 1307910235737948252
 HEADER_HELPER_BOT_ID = 874910942490677270
 INCENSE_CHANNELS = {str(i) for i in range(1, 11)}
 
-# Despawn safety window (20s total per channel; skip only if older than 19.3s)
-INCENSE_DESPAWN_LIMIT = 19.3
+# Hard cutoff before sending: if a spawn is >= 18.0s old, skip it so it never
+# arrives at Discord after the 20.0s despawn timer or delays the next channel
+INCENSE_DESPAWN_LIMIT = 18.0
 
 # --- Global State & Locks ---
 is_paused = False
@@ -34,7 +35,7 @@ incense_cmd_task: asyncio.Task | None = None
 # Ensures the bot can NEVER send two messages at the exact same time across any channel
 bot_action_lock = asyncio.Lock()
 
-# Tracks the monotonic timestamp of ANY message sent by your account (bot or manual)
+# Monotonic timestamp of when the last send completed
 last_send_time: float = 0.0
 
 # --- Staggered Incense EDF Scheduler State ---
@@ -65,13 +66,14 @@ def get_pokemon_name(content: str) -> str | None:
 async def paced_send(
     channel: discord.abc.Messageable,
     content: str,
-    min_gap: float = 1.35,
-    max_gap: float = 1.65,
-) -> float:
+    min_gap: float = 0.85,
+    max_gap: float = 1.10,
+    spawn_ts: float | None = None,
+) -> tuple[bool, float]:
     """
-    Acquires bot_action_lock and sends a message while respecting a 1.35s-1.65s
-    cooldown from the last completed send (or manual user message).
-    Prevents Discord 429 rate limits while catching 10 spawns in ~15s (< 20s window).
+    Acquires bot_action_lock, enforces a fast random gap from the last completed send,
+    and verifies the spawn hasn't crossed INCENSE_DESPAWN_LIMIT right before sending.
+    Returns (was_sent, sleep_gap_used).
     """
     global last_send_time
     async with bot_action_lock:
@@ -79,56 +81,91 @@ async def paced_send(
         elapsed_since_last = time.monotonic() - last_send_time
         remaining_sleep = max(0.0, target_gap - elapsed_since_last)
 
+        # If sleeping + sending would push this spawn past 18.0s, drop it immediately
+        # without sleeping so the next channel in the wave is caught right away
+        if spawn_ts is not None:
+            projected_age = (time.monotonic() - spawn_ts) + remaining_sleep
+            if projected_age >= INCENSE_DESPAWN_LIMIT:
+                return False, 0.0
+
         if remaining_sleep > 0:
             await asyncio.sleep(remaining_sleep)
 
+        # Final check right before HTTP POST
+        if spawn_ts is not None and (time.monotonic() - spawn_ts) >= INCENSE_DESPAWN_LIMIT:
+            return False, 0.0
+
         await channel.send(content)
         last_send_time = time.monotonic()
-        return target_gap
+        return True, target_gap
 
 
 async def incense_scheduler_loop() -> None:
     """
-    Earliest-Deadline-First (EDF) worker for Incense Mode.
-    Always catches the oldest waiting channel first (Channel 1 -> 2 -> 3 ... -> 10).
+    Fast Earliest-Deadline-First (EDF) worker for Incense Mode.
+    Clears all 10 channels in ~10.5 to 12.5 seconds total so zero spawns hit 20s.
     """
     while True:
         await incense_wake_event.wait()
 
         while active_channel_spawns and is_incense_mode and not is_paused:
-            # Pick the channel whose spawn appeared earliest (Earliest Deadline First)
+            # Purge any already-expired spawns first so they never block fresh channels
+            now = time.monotonic()
+            expired_channels = [
+                ch for ch, (ts, _, _) in active_channel_spawns.items()
+                if (now - ts) >= INCENSE_DESPAWN_LIMIT
+            ]
+            for ch in expired_channels:
+                exp_ts, _, exp_poke = active_channel_spawns.pop(ch)
+                print(
+                    f"⏳ [Incense] Skipped late spawn {exp_poke} in #{ch} "
+                    f"(Age: {now - exp_ts:.1f}s - saved slot for next channel)"
+                )
+
+            if not active_channel_spawns:
+                break
+
+            # Pick the channel whose spawn appeared earliest (Channel 1 -> 2 -> ... -> 10)
             oldest_channel = min(
                 active_channel_spawns.keys(),
                 key=lambda ch: active_channel_spawns[ch][0],
             )
             spawn_ts, channel_obj, pokemon_name = active_channel_spawns.pop(oldest_channel)
 
-            age = time.monotonic() - spawn_ts
-            if age >= INCENSE_DESPAWN_LIMIT:
-                print(
-                    f"⏳ [Incense] Dropped expired {pokemon_name} in #{oldest_channel} "
-                    f"(Age: {age:.1f}s >= 20s)"
-                )
-                continue
-
             final_name = pokemon_name.lower() if random.random() < 0.70 else pokemon_name
             cmd = random.choice(["c", "catch"])
             final_message = f"<@{POKETWO_BOT_ID}> {cmd} {final_name}"
 
             try:
-                # If backlog is high (>= 5 waiting), slightly tighten gap to 1.25s-1.45s
+                # Dynamic speed boost: when >= 3 channels are waiting, tighten gap to 0.70s-0.92s
+                # (plus ~0.30s HTTP send time = ~1.05s total per channel -> 10 channels in ~10.5s)
                 backlog = len(active_channel_spawns)
-                min_g, max_g = (1.25, 1.45) if backlog >= 5 else (1.35, 1.65)
+                if backlog >= 5:
+                    min_g, max_g = 0.65, 0.85
+                elif backlog >= 2:
+                    min_g, max_g = 0.75, 0.95
+                else:
+                    min_g, max_g = 0.85, 1.10
 
-                gap_used = await paced_send(
-                    channel_obj, final_message, min_gap=min_g, max_gap=max_g
+                sent, gap_used = await paced_send(
+                    channel_obj,
+                    final_message,
+                    min_gap=min_g,
+                    max_gap=max_g,
+                    spawn_ts=spawn_ts,
                 )
-                total_age = time.monotonic() - spawn_ts
-                print(
-                    f"🏓 [Incense] Caught {final_name} in #{oldest_channel} "
-                    f"(Pace: {int(gap_used * 1000)}ms | Spawn Age: {total_age:.2f}s/20s | "
-                    f"Remaining in wave: {len(active_channel_spawns)})"
-                )
+                if sent:
+                    total_age = time.monotonic() - spawn_ts
+                    print(
+                        f"🏓 [Incense] Caught {final_name} in #{oldest_channel} "
+                        f"(Gap: {int(gap_used * 1000)}ms | Spawn Age: {total_age:.2f}s/20s | "
+                        f"Queue: {len(active_channel_spawns)})"
+                    )
+                else:
+                    print(
+                        f"⏳ [Incense] Aborted late send for {final_name} in #{oldest_channel} "
+                        f"(Age >= {INCENSE_DESPAWN_LIMIT}s)"
+                    )
             except Exception as e:
                 print(f"⚠️ [Incense] Send error in #{oldest_channel}: {e}")
 
@@ -167,8 +204,8 @@ async def run_incense_channel_command(
             print(f"⚠️ [Incense] Channel '{i}' not found in this server. Skipping.")
             continue
 
-        # Yield briefly so any ready EDF spawn catch can interleave smoothly
-        await asyncio.sleep(random.uniform(1.35, 1.65))
+        # Brief yield so active spawns in earlier channels get caught first
+        await asyncio.sleep(random.uniform(1.0, 1.3))
 
         if abort_if_paused and (is_paused or not is_incense_mode):
             print(f"⏹️ [Incense] '{subcommand}' sequence halted before sending.")
@@ -176,8 +213,8 @@ async def run_incense_channel_command(
 
         cmd_msg = f"<@{POKETWO_BOT_ID}> {subcommand}"
         try:
-            gap_used = await paced_send(channel, cmd_msg, min_gap=1.35, max_gap=1.65)
-            print(f"✅ [Incense] Sent '{subcommand}' in #{channel.name} (Pace: {int(gap_used * 1000)}ms)")
+            _, gap_used = await paced_send(channel, cmd_msg, min_gap=0.90, max_gap=1.20)
+            print(f"✅ [Incense] Sent '{subcommand}' in #{channel.name} (Gap: {int(gap_used * 1000)}ms)")
         except Exception as e:
             print(f"⚠️ [Incense] Failed sending '{subcommand}' in #{channel.name}: {e}")
 
@@ -205,7 +242,7 @@ async def on_ready() -> None:
     if incense_worker_task is None or incense_worker_task.done():
         incense_worker_task = bot.loop.create_task(incense_scheduler_loop())
 
-    print(f"Logged in as {bot.user} | Staggered EDF Incense Catcher + 429 Guard Active.")
+    print(f"Logged in as {bot.user} | High-Speed EDF Incense Catcher Active.")
     print(f"🎯 [Stealth] Next forced miss is scheduled in {next_miss_target} pings.")
 
 
@@ -218,9 +255,9 @@ async def on_message(message: discord.Message) -> None:
 
     # 1. Handle own messages & commands
     if message.author.id == bot.user.id:
-        # Record timestamp of ANY message sent by your account (including manual commands)
-        # so the incense scheduler automatically spaces its next send to avoid 429 rate limits
-        last_send_time = time.monotonic()
+        # Only update last_send_time if YOU manually typed something (ignore bot's own Pokétwo echoes)
+        if not message.content.startswith(f"<@{POKETWO_BOT_ID}>"):
+            last_send_time = time.monotonic()
 
         if msg_content == "!pause":
             is_paused = True
@@ -343,7 +380,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # =========================================================================
-    # 4A. INCENSE MODE CATCHING LOGIC (Staggered EDF Scheduler)
+    # 4A. INCENSE MODE CATCHING LOGIC (High-Speed EDF Scheduler)
     # =========================================================================
     if is_incense_mode:
         channel_name = getattr(message.channel, "name", "")
