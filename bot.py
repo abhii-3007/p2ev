@@ -1,6 +1,7 @@
 import asyncio
 import random
 import re
+import sys
 import discord
 
 from config import DISCORD_TOKEN, POKETWO_BOT_ID, HELPER_BOT_IDS
@@ -21,6 +22,10 @@ INCENSE_CHANNELS = {str(i) for i in range(1, 11)}
 is_paused = False
 is_afk = False
 is_incense_mode = False
+active_incense_guild: discord.Guild | None = None
+
+# Task tracker for ongoing channel 1-10 command loops (buy / p / r)
+incense_cmd_task: asyncio.Task | None = None
 
 # This lock ensures the bot can never type/send two different messages at the exact same time
 bot_action_lock = asyncio.Lock()
@@ -56,12 +61,20 @@ async def afk_timer(afk_seconds: int) -> None:
     print("🔙 [Stealth] Back at the keyboard. Resuming auto-catch automatically!")
 
 
-async def buy_incense_sequence(guild: discord.Guild) -> None:
-    """Buys incense sequentially in channels named 1 to 10 with a 1-2s random delay."""
-    print("🔥 [Incense] Starting incense purchase sequence across channels 1 to 10...")
+async def run_incense_channel_command(
+    guild: discord.Guild,
+    subcommand: str,
+    action_label: str,
+    abort_if_paused: bool = True,
+) -> None:
+    """
+    Sends '<@POKETWO_BOT_ID> <subcommand>' across channels 1 to 10 in the given server
+    one by one with a random 1.0 to 2.0 second delay.
+    """
+    print(f"🔥 [Incense] Starting '{subcommand}' ({action_label}) across channels 1 to 10...")
     for i in range(1, 11):
-        if is_paused or not is_incense_mode:
-            print("⏹️ [Incense] Purchase sequence halted (bot paused or switched to normal mode).")
+        if abort_if_paused and (is_paused or not is_incense_mode):
+            print(f"⏹️ [Incense] '{subcommand}' sequence halted (bot paused or switched to normal mode).")
             return
 
         channel = discord.utils.get(guild.text_channels, name=str(i))
@@ -73,18 +86,33 @@ async def buy_incense_sequence(guild: discord.Guild) -> None:
         await asyncio.sleep(delay)
 
         async with bot_action_lock:
-            if is_paused or not is_incense_mode:
-                print("⏹️ [Incense] Purchase sequence halted before sending.")
+            if abort_if_paused and (is_paused or not is_incense_mode):
+                print(f"⏹️ [Incense] '{subcommand}' sequence halted before sending.")
                 return
 
-            cmd_msg = f"<@{POKETWO_BOT_ID}> inc buy -y"
+            cmd_msg = f"<@{POKETWO_BOT_ID}> {subcommand}"
             async with channel.typing():
                 await asyncio.sleep(len(cmd_msg) * random.uniform(0.03, 0.06))
 
             await channel.send(cmd_msg)
-            print(f"✅ [Incense] Bought incense in #{channel.name} (Delay: {int(delay * 1000)}ms)")
+            print(f"✅ [Incense] Sent '{subcommand}' in #{channel.name} (Delay: {int(delay * 1000)}ms)")
 
-    print("🎉 [Incense] Finished buying incense in channels 1 to 10!")
+    print(f"🎉 [Incense] Finished '{subcommand}' ({action_label}) in channels 1 to 10!")
+
+
+def start_incense_channel_task(
+    guild: discord.Guild,
+    subcommand: str,
+    action_label: str,
+    abort_if_paused: bool = True,
+) -> None:
+    """Cancels any previous 1-10 channel command loop before starting the new one."""
+    global incense_cmd_task
+    if incense_cmd_task and not incense_cmd_task.done():
+        incense_cmd_task.cancel()
+    incense_cmd_task = bot.loop.create_task(
+        run_incense_channel_command(guild, subcommand, action_label, abort_if_paused)
+    )
 
 
 @bot.event
@@ -95,7 +123,7 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    global is_paused, is_afk, is_incense_mode
+    global is_paused, is_afk, is_incense_mode, active_incense_guild
     global ping_counter, next_miss_target, pending_catches
 
     msg_content = message.content.strip().lower()
@@ -113,22 +141,51 @@ async def on_message(message: discord.Message) -> None:
             print(f"▶️ Bot manually resumed in {mode_str}.")
             return
 
-        if msg_content == "!inc":
+        if msg_content == "!inc_start":
             is_incense_mode = True
+            is_paused = False
             is_afk = False
-            print("🔥 [Mode Switch] INCENSE MODE ACTIVATED. Normal ping-catching is now OFF.")
             if message.guild:
-                bot.loop.create_task(buy_incense_sequence(message.guild))
+                active_incense_guild = message.guild
+                print("🔥 [Mode Switch] INCENSE MODE STARTED. Buying incense in channels 1-10 & catching enabled.")
+                start_incense_channel_task(
+                    message.guild, "inc buy -y", "Buy Incense", abort_if_paused=True
+                )
+            return
+
+        if msg_content == "!inc_pause":
+            is_paused = True
+            target_guild = message.guild or active_incense_guild
+            print("⏸️ [Incense] !inc_pause triggered. Pausing catches and sending 'inc p' to channels 1-10...")
+            if target_guild:
+                start_incense_channel_task(
+                    target_guild, "inc p", "Pause Incense", abort_if_paused=False
+                )
+            return
+
+        if msg_content == "!inc_resume":
+            is_incense_mode = True
+            is_paused = False
+            is_afk = False
+            target_guild = message.guild or active_incense_guild
+            print("▶️ [Incense] !inc_resume triggered. Resuming catches and sending 'inc r' to channels 1-10...")
+            if target_guild:
+                active_incense_guild = target_guild
+                start_incense_channel_task(
+                    target_guild, "inc r", "Resume Incense", abort_if_paused=True
+                )
             return
 
         if msg_content == "!normal":
             is_incense_mode = False
+            if incense_cmd_task and not incense_cmd_task.done():
+                incense_cmd_task.cancel()
             print("🌿 [Mode Switch] NORMAL MODE ACTIVATED. Incense mode is now OFF.")
             return
 
         return
 
-    # 2. Safety conditions (Captcha - pauses in BOTH modes)
+    # 2. Safety conditions (Captcha - pauses in BOTH modes; runs inc p in Incense Mode)
     if (
         message.author.id == POKETWO_BOT_ID
         and "Please tell us you're human!" in message.content
@@ -136,6 +193,14 @@ async def on_message(message: discord.Message) -> None:
     ):
         is_paused = True
         print("⚠️ Captcha detected targeting YOUR account. Script paused immediately!")
+
+        if is_incense_mode:
+            target_guild = message.guild or active_incense_guild
+            if target_guild:
+                print("🛑 [Incense] Captcha detected during Incense Mode! Sending 'inc p' across channels 1 to 10...")
+                start_incense_channel_task(
+                    target_guild, "inc p", "Captcha Auto-Pause Incense", abort_if_paused=False
+                )
         return
 
     # 3. Shiny Catch Sequence (Pauses ONLY in Normal Mode; continues in Incense Mode)
@@ -184,6 +249,9 @@ async def on_message(message: discord.Message) -> None:
     if is_incense_mode:
         channel_name = getattr(message.channel, "name", "")
         if message.author.id == INCENSE_HELPER_BOT_ID and channel_name in INCENSE_CHANNELS:
+            if message.guild:
+                active_incense_guild = message.guild
+
             pokemon_name = get_pokemon_name(message.content)
             if not pokemon_name:
                 return
@@ -362,4 +430,7 @@ async def on_message(message: discord.Message) -> None:
 
 
 if __name__ == "__main__":
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+        print("❌ ERROR: DISCORD_TOKEN is missing! Set it in your .env file or paste it inside config.py.")
+        sys.exit(1)
     bot.run(DISCORD_TOKEN)
